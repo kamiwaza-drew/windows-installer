@@ -1863,6 +1863,24 @@ class HeadlessKamiwazaInstaller:
             # Get current timestamp for logging
             import datetime
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Before we let APT/DPKG run the package pre-installation scripts, make sure
+            # Docker Desktop's integration is actually ready inside WSL. The .deb's
+            # preinst script checks for Docker and Docker Compose; if Docker Desktop
+            # hasn't finished wiring up /usr/bin/docker (symlink into /mnt/wsl/...), the
+            # check can fail even though Docker is installed on Windows.
+            self.log_output("=== PRE-CHECK: VERIFYING DOCKER READINESS INSIDE WSL ===")
+            if not self.wait_for_docker_readiness(wsl_cmd):
+                self.log_output("CRITICAL: Docker is not ready inside WSL - aborting Kamiwaza package installation.")
+                self.log_output("Please ensure Docker Desktop is running, WSL integration is enabled,")
+                self.log_output("and that 'docker version' works inside the Kamiwaza WSL instance, then re-run this installer.")
+                try:
+                    # Best-effort log copy so the user has full diagnostics
+                    self.copy_logs_to_windows(wsl_cmd, timestamp)
+                except Exception as e:
+                    self.log_output(f"Warning: Failed to copy logs after Docker readiness failure: {e}")
+                self._wait_for_user_input("Press Enter to exit...")
+                return 1
             
             # First, log the start of installation
             self.log_output(f"Step 1/3: Logging installation start", progress=60)
@@ -2999,6 +3017,90 @@ networkingMode=mirrored
         except Exception as e:
             self.log_output(f"Warning: Error disabling IPv6: {e}")
             self.log_output("Continuing with installation anyway...")
+
+    def wait_for_docker_readiness(self, wsl_cmd, max_wait_seconds=300, check_interval=5):
+        """
+        Ensure Docker (and Docker Compose) are actually usable inside WSL before we
+        trigger the Kamiwaza .deb installation. This protects against the case where
+        /usr/bin/docker is a symlink into /mnt/wsl/docker-desktop/... but Docker
+        Desktop's WSL integration has not fully initialized yet.
+        """
+        try:
+            import time
+
+            self.log_output("=== DOCKER READINESS CHECK (INSIDE WSL) ===")
+            self.log_output(f"[INFO] Maximum wait time: {max_wait_seconds}s, check interval: {check_interval}s")
+
+            elapsed = 0
+            while elapsed <= max_wait_seconds:
+                # This script deliberately mimics what the .deb's preinst script expects:
+                # - docker CLI must be discoverable on PATH
+                # - docker must be executable and able to talk to the daemon
+                # - docker-compose OR 'docker compose' must be available and runnable
+                check_cmd = r"""
+set -e
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo 'DOCKER_CHECK:docker_not_found'
+  exit 1
+fi
+
+if ! docker version >/dev/null 2>&1; then
+  echo 'DOCKER_CHECK:docker_daemon_not_ready'
+  exit 2
+fi
+
+if command -v docker-compose >/dev/null 2>&1; then
+  if ! docker-compose version >/dev/null 2>&1; then
+    echo 'DOCKER_CHECK:docker_compose_not_ready'
+    exit 3
+  fi
+elif docker compose version >/dev/null 2>&1; then
+  :
+else
+  echo 'DOCKER_CHECK:docker_compose_not_found'
+  exit 4
+fi
+
+echo 'DOCKER_CHECK:ok'
+"""
+                ret, out, err = self.run_command(
+                    wsl_cmd + ['bash', '-c', check_cmd],
+                    timeout=60
+                )
+
+                normalized_out = (out or "").strip()
+                if ret == 0 and "DOCKER_CHECK:ok" in normalized_out:
+                    self.log_output("[OK] Docker and Docker Compose are ready inside WSL.")
+                    return True
+
+                # Log detailed diagnostics for debugging
+                if normalized_out:
+                    self.log_output(f"[DEBUG] Docker readiness check stdout: {normalized_out}")
+                if err:
+                    self.log_output(f"[DEBUG] Docker readiness check stderr: {err.strip()}")
+
+                elapsed += check_interval
+                if elapsed > max_wait_seconds:
+                    break
+
+                self.log_output(
+                    f"[INFO] Docker not ready yet - waiting {check_interval}s "
+                    f"(elapsed {elapsed}/{max_wait_seconds}s)..."
+                )
+                time.sleep(check_interval)
+
+            self.log_output("CRITICAL: Docker Desktop / Docker CLI were not ready inside WSL within the allowed time.")
+            self.log_output("Please make sure:")
+            self.log_output("  - Docker Desktop is running on Windows")
+            self.log_output("  - WSL integration is enabled for the Kamiwaza distribution")
+            self.log_output("  - Running 'docker version' inside WSL succeeds without errors")
+            return False
+
+        except Exception as e:
+            self.log_output(f"Error while checking Docker readiness: {e}")
+            self.log_output("Falling back to conservative behavior: treating Docker as NOT ready.")
+            return False
 
     def check_gui_manager_installed(self):
         """Check if GUI Manager is already installed"""
